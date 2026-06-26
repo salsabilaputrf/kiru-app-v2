@@ -1,0 +1,187 @@
+datasource db {
+  provider = "postgresql"
+}
+
+generator client {
+  provider = "prisma-client"
+  output   = "../src/generated/prisma"
+}
+
+enum Role {
+  owner
+  admin
+  kasir
+}
+
+enum Tier {
+  bronze
+  silver
+  gold
+}
+
+enum DiscountType {
+  percentage
+  nominal
+}
+
+enum PaymentMethod {
+  cash
+  qris
+  debit
+}
+
+// ==========================================
+// 1. CABANG & USER
+// ==========================================
+model Branch {
+  id           Int           @id @default(autoincrement())
+  name         String
+  address      String
+  users        User[]
+  inventory    BranchInventory[]
+  transactions Transaction[] // Relasi transaksi per cabang
+
+  @@map("branches")
+}
+
+model User {
+  id           Int           @id @default(autoincrement())
+  username     String        @unique
+  password     String
+  role         Role
+  branchId     Int?          @map("branch_id")
+  branch       Branch?       @relation(fields: [branchId], references: [id], onDelete: SetNull)
+  transactions Transaction[] // Track transaksi yang dilayani oleh kasir terkait
+
+  @@map("users")
+}
+
+// ==========================================
+// 2. KATALOG PRODUK & MULTI-UOM (BARCODE)
+// ==========================================
+model Product {
+  id           Int               @id @default(autoincrement())
+  sku          String            @unique
+  name         String
+  categoryId   Int               @map("category_id")
+  status       String            @default("active")
+  createdAt    DateTime          @default(now())
+  units        ProductUnit[]
+  inventory    BranchInventory[]
+  promoItems   ProductPromotionItem[]
+
+  @@map("products")
+}
+
+model ProductUnit {
+  id               Int               @id @default(autoincrement())
+  productId        Int               @map("product_id")
+  unitName         String            @map("unit_name")
+  multiplier       Int               @default(1)
+  barcode          String            @unique
+  priceBuy         Decimal           @map("price_buy") @db.Decimal(10, 2)
+  priceSell        Decimal           @map("price_sell") @db.Decimal(10, 2)
+  product          Product           @relation(fields: [productId], references: [id], onDelete: Cascade)
+  transactionItems TransactionItem[] // Jejak unit UoM yang discan saat transaksi
+
+  @@map("product_units")
+}
+
+// ==========================================
+// 3. INVENTARIS CABANG
+// ==========================================
+model BranchInventory {
+  id                Int     @id @default(autoincrement())
+  branchId          Int     @map("branch_id")
+  productId         Int     @map("product_id")
+  stockQty          Int     @default(0) @map("stock_qty") // Selalu dalam satuan Pcs (terkecil)
+  lowStockThreshold Int     @default(10) @map("low_stock_threshold")
+  branch            Branch  @relation(fields: [branchId], references: [id], onDelete: Cascade)
+  product           Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([branchId, productId])
+  @@map("branch_inventories")
+}
+
+// ==========================================
+// 4. PROMO & CUSTOMER LOYALTY
+// ==========================================
+model ProductPromotion {
+  id            Int                    @id @default(autoincrement())
+  promoName     String                 @map("promo_name")
+  discountType  DiscountType           @map("discount_type")
+  discountValue Decimal                @map("discount_value") @db.Decimal(10, 2)
+  startDate     DateTime               @map("start_date")
+  endDate       DateTime               @map("end_date")
+  isActive      Boolean                @default(true) @map("is_active")
+  products      ProductPromotionItem[]
+
+  @@map("product_promotions")
+}
+
+// Pivot table handle M-to-M Produk dan Promo Aktif
+model ProductPromotionItem {
+  id          Int              @id @default(autoincrement())
+  promoId     Int              @map("promo_id")
+  productId   Int              @map("product_id")
+  promo       ProductPromotion @relation(fields: [promoId], references: [id], onDelete: Cascade)
+  product     Product          @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@unique([promoId, productId])
+  @@map("product_promotion_items")
+}
+
+model Customer {
+  id           Int           @id @default(autoincrement())
+  memberCode   String        @unique @map("member_code")
+  name         String
+  phone        String
+  points       Int           @default(0)
+  tier         Tier          @default(bronze)
+  transactions Transaction[]
+
+  @@map("customers")
+}
+
+// ==========================================
+// 5. TRANSAKSI / SALES LAYER (BARU)
+// ==========================================
+model Transaction {
+  id              Int               @id @default(autoincrement())
+  invoiceNumber   String            @unique @map("invoice_number") // Contoh: INV/20260626/0001
+  branchId        Int               @map("branch_id")
+  userId          Int               @map("user_id") // ID Kasir
+  customerId      Int?              @map("customer_id") // Null jika non-member
+  subtotal        Decimal           @db.Decimal(10, 2)  // Total kotor sebelum diskon member global
+  promoDiscount   Decimal           @default(0.00) @map("promo_discount") @db.Decimal(10, 2) // Akumulasi potongan promo produk
+  memberDiscount  Decimal           @default(0.00) @map("member_discount") @db.Decimal(10, 2) // Potongan tier member global
+  totalPay        Decimal           @map("total_pay") @db.Decimal(10, 2)   // Formula: Subtotal - MemberDiscount
+  paidAmount      Decimal           @map("paid_amount") @db.Decimal(10, 2) // Uang yang diserahkan
+  changeAmount    Decimal           @map("change_amount") @db.Decimal(10, 2) // Kembalian
+  paymentMethod   PaymentMethod     @map("payment_method")
+  pointsEarned    Int               @default(0) @map("points_earned")
+  createdAt       DateTime          @default(now()) @map("created_at")
+
+  branch          Branch            @relation(fields: [branchId], references: [id])
+  user            User              @relation(fields: [userId], references: [id])
+  customer        Customer?         @relation(fields: [customerId], references: [id], onDelete: SetNull)
+  items           TransactionItem[]
+
+  @@map("transactions")
+}
+
+model TransactionItem {
+  id            Int         @id @default(autoincrement())
+  transactionId Int         @map("transaction_id")
+  productUnitId Int         @map("product_unit_id") // Melacak barcode/UoM spesifik yang dipindai
+  qty           Int         // Kuantitas unit yang dibeli (misal beli 2 Dus)
+  priceNormal   Decimal     @map("price_normal") @db.Decimal(10, 2) // Harga satuan normal UoM saat itu
+  discountPromo Decimal     @default(0.00) @map("discount_promo") @db.Decimal(10, 2) // Potongan promo per item
+  priceFinal    Decimal     @map("price_final") @db.Decimal(10, 2)  // Harga bersih setelah promo per item
+  totalItemBill Decimal     @map("total_item_bill") @db.Decimal(10, 2) // Formula: priceFinal * qty
+
+  transaction   Transaction @relation(fields: [transactionId], references: [id], onDelete: Cascade)
+  productUnit   ProductUnit @relation(fields: [productUnitId], references: [id])
+
+  @@map("transaction_items")
+}
